@@ -1,0 +1,21 @@
+# Ignore Google OAuth credentials and tokens
+credentials.json
+token.pickle
+
+# Python bytecode
+__pycache__/
+*.py[cod]
+
+# Virtual environment folders (adjust if your venv folder name is different)
+venv/
+env/
+.env/
+
+# IDE/editor specific files (optional)
+.vscode/
+.idea/
+*.iml
+
+# Logs and databases (optional)
+*.log
+*.sqlite3
