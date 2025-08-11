@@ -1,0 +1,23 @@
+{
+  "name": "daily-deals-bot",
+  "version": "1.0.0",
+  "description": "Daily deals aggregator bot that posts to Blogger with image hosting",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "test": "echo \"No tests specified\" && exit 0"
+  },
+  "keywords": [
+    "deals",
+    "blogger",
+    "automation",
+    "cloudinary",
+    "imgur"
+  ],
+  "author": "Your Name",
+  "license": "MIT",
+  "dependencies": {
+    "axios": "^1.4.0",
+    "dotenv": "^16.3.1"
+  }
+}
