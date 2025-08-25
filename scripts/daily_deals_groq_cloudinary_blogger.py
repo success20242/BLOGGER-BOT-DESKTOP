@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # daily_deals_groq_cloudinary_blogger_fixed.py
 # Fully integrated: Groq content + structured commentary + Cloudinary image + Blogger post
-# Only posts RSS items from the last FEED_HOURS_BACK hours
+# Auto-refreshing Blogger token using token.pickle
 
 import os
 import json
@@ -10,21 +10,25 @@ import requests
 import feedparser
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
+from google_auth_oauthlib.flow import InstalledAppFlow
+from google.auth.transport.requests import Request
+import pickle
 
 load_dotenv()
 
 # ------------------- CONFIGURATION -------------------
 
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-GROQ_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-20b")  # Updated valid Groq model
-GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"  # New endpoint
+GROQ_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-20b")
+GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
 
 CLOUDINARY_CLOUD_NAME = os.getenv("CLOUDINARY_CLOUD_NAME")
 CLOUDINARY_API_KEY = os.getenv("CLOUDINARY_API_KEY")
 CLOUDINARY_API_SECRET = os.getenv("CLOUDINARY_API_SECRET")
 
 BLOG_ID = os.getenv("BLOG_ID")
-BLOGGER_OAUTH_TOKEN = os.getenv("BLOGGER_OAUTH_TOKEN")
+CLIENT_SECRET_FILE = "client_secret.json"
+TOKEN_PICKLE = "token.pickle"
 
 FEEDS = [
     "https://slickdeals.net/newsearch.php?src=SearchBarV2&q=&mode=rss",
@@ -55,7 +59,6 @@ def save_posted_link(link):
     print(f"[DEBUG] Saved posted link: {link}")
 
 def hash_text(text):
-    import hashlib
     return hashlib.md5(text.encode()).hexdigest()
 
 # ------------------- CLOUDINARY -------------------
@@ -70,8 +73,7 @@ def upload_image_to_cloudinary(image_url):
             auth=(CLOUDINARY_API_KEY, CLOUDINARY_API_SECRET)
         )
         response.raise_for_status()
-        result = response.json()
-        secure_url = result.get("secure_url")
+        secure_url = response.json().get("secure_url")
         print(f"[DEBUG] Cloudinary URL: {secure_url}")
         return secure_url
     except Exception as e:
@@ -81,9 +83,6 @@ def upload_image_to_cloudinary(image_url):
 # ------------------- GROQ API -------------------
 
 def groq_generate(prompt, max_tokens=300):
-    """
-    Generates text using the Groq OpenAI-compatible API endpoint
-    """
     headers = {
         "Authorization": f"Bearer {GROQ_API_KEY}",
         "Content-Type": "application/json"
@@ -93,7 +92,6 @@ def groq_generate(prompt, max_tokens=300):
         "messages": [{"role": "user", "content": prompt}],
         "max_tokens": max_tokens
     }
-
     try:
         response = requests.post(GROQ_API_URL, headers=headers, json=payload)
         response.raise_for_status()
@@ -134,12 +132,30 @@ Output in HTML format with <ul><li>...</li></ul> for pros/cons
     print(f"[DEBUG] Generated commentary for {title}")
     return content
 
+# ------------------- BLOGGER AUTH -------------------
+
+def get_blogger_token():
+    creds = None
+    if os.path.exists(TOKEN_PICKLE):
+        with open(TOKEN_PICKLE, "rb") as token_file:
+            creds = pickle.load(token_file)
+    if not creds or not creds.valid:
+        if creds and creds.expired and creds.refresh_token:
+            creds.refresh(Request())
+        else:
+            flow = InstalledAppFlow.from_client_secrets_file(CLIENT_SECRET_FILE, ["https://www.googleapis.com/auth/blogger"])
+            creds = flow.run_local_server(port=0)
+        with open(TOKEN_PICKLE, "wb") as token_file:
+            pickle.dump(creds, token_file)
+    return creds.token
+
 # ------------------- BLOGGER POST -------------------
 
 def publish_to_blogger(title, content, labels=None):
+    token = get_blogger_token()
     url = f"https://www.googleapis.com/blogger/v3/blogs/{BLOG_ID}/posts/"
     headers = {
-        "Authorization": f"Bearer {BLOGGER_OAUTH_TOKEN}",
+        "Authorization": f"Bearer {token}",
         "Content-Type": "application/json"
     }
     data = {
@@ -180,7 +196,6 @@ def run_once():
                 print("[DEBUG] Reached max posts limit for this run")
                 return
 
-            # Skip old posts
             published_parsed = entry.get("published_parsed") or entry.get("updated_parsed")
             if not published_parsed:
                 print(f"[DEBUG] No timestamp found for {entry.get('title','Unknown')}. Skipping.")
