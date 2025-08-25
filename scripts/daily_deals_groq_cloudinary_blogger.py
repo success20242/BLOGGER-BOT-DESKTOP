@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# daily_deals_groq_cloudinary_blogger_filtered.py
+# daily_deals_groq_cloudinary_blogger_auto_model.py
 # Fully integrated: Groq content + structured commentary + Cloudinary image + Blogger post
 # Only posts RSS items from the last FEED_HOURS_BACK hours
 
@@ -16,8 +16,7 @@ load_dotenv()
 # ------------------- CONFIGURATION -------------------
 
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
-GROQ_API_URL = "https://api.groq.com/v1/engines/text/completions"  # Replace with actual endpoint
+GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"  # OpenAI-compatible endpoint
 
 CLOUDINARY_CLOUD_NAME = os.getenv("CLOUDINARY_CLOUD_NAME")
 CLOUDINARY_API_KEY = os.getenv("CLOUDINARY_API_KEY")
@@ -34,8 +33,34 @@ FEEDS = [
 ]
 
 MAX_POSTS = int(os.getenv("MAX_POSTS_PER_RUN", 1))
-FEED_HOURS_BACK = int(os.getenv("FEED_HOURS_BACK", 72))  # Only post items within this many hours
+FEED_HOURS_BACK = int(os.getenv("FEED_HOURS_BACK", 72))
 POSTED_LOG = "posted_links.json"
+
+# ------------------- GROQ MODEL DYNAMIC SELECTION -------------------
+
+def get_first_available_model():
+    """
+    Fetches available Groq models dynamically and returns the first one.
+    """
+    headers = {"Authorization": f"Bearer {GROQ_API_KEY}"}
+    models_url = "https://api.groq.com/openai/v1/models"
+    try:
+        response = requests.get(models_url, headers=headers)
+        response.raise_for_status()
+        data = response.json()
+        models = [m["id"] for m in data.get("data", [])]
+        if models:
+            print(f"[DEBUG] Available models: {models}")
+            return models[0]  # pick the first available model
+        else:
+            print("[ERROR] No models returned by Groq API; defaulting to 'openai/gpt-oss-20b'")
+            return "openai/gpt-oss-20b"
+    except Exception as e:
+        print(f"[ERROR] Failed to fetch Groq models: {e}")
+        return "openai/gpt-oss-20b"
+
+GROQ_MODEL = get_first_available_model()
+print(f"[DEBUG] Using Groq model: {GROQ_MODEL}")
 
 # ------------------- UTILITIES -------------------
 
@@ -81,19 +106,24 @@ def upload_image_to_cloudinary(image_url):
 # ------------------- GROQ API -------------------
 
 def groq_generate(prompt, max_tokens=300):
+    """
+    Generates text using the Groq OpenAI-compatible API endpoint
+    """
     headers = {
         "Authorization": f"Bearer {GROQ_API_KEY}",
         "Content-Type": "application/json"
     }
     payload = {
-        "prompt": prompt,
+        "model": GROQ_MODEL,
+        "messages": [{"role": "user", "content": prompt}],
         "max_tokens": max_tokens
     }
+
     try:
         response = requests.post(GROQ_API_URL, headers=headers, json=payload)
         response.raise_for_status()
         data = response.json()
-        return data.get("completion_text", "<p>No content generated</p>")
+        return data["choices"][0]["message"]["content"]
     except Exception as e:
         print(f"[ERROR] Groq API request failed: {e}")
         return "<p>Error generating content.</p>"
