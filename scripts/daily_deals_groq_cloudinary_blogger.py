@@ -7,16 +7,13 @@ import json
 import requests
 import hashlib
 import feedparser
-from datetime import datetime
-from openai import OpenAI
 
 # ------------------- CONFIGURATION -------------------
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")  # Groq/LLM key
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")  # Your Groq API key
 CLOUDINARY_CLOUD_NAME = os.getenv("CLOUDINARY_CLOUD_NAME")
 CLOUDINARY_API_KEY = os.getenv("CLOUDINARY_API_KEY")
 CLOUDINARY_API_SECRET = os.getenv("CLOUDINARY_API_SECRET")
 BLOGGER_BLOG_ID = os.getenv("BLOGGER_BLOG_ID")
-BLOGGER_API_KEY = os.getenv("BLOGGER_API_KEY")
 BLOGGER_OAUTH_TOKEN = os.getenv("BLOGGER_OAUTH_TOKEN")
 
 FEED_URLS = [
@@ -39,9 +36,6 @@ def save_posted_link(link):
     with open(POSTED_LOG, "w") as f:
         json.dump(list(posted), f)
 
-def hash_text(text):
-    return hashlib.md5(text.encode()).hexdigest()
-
 # ------------------- CLOUDINARY -------------------
 
 def upload_image_to_cloudinary(image_url):
@@ -57,46 +51,52 @@ def upload_image_to_cloudinary(image_url):
     result = response.json()
     return result.get("secure_url")
 
-# ------------------- GROQ / OpenAI -------------------
+# ------------------- GROQ API -------------------
 
-client = OpenAI(api_key=OPENAI_API_KEY)
+GROQ_API_URL = "https://api.groq.ai/v1/completions"
+
+def groq_request(prompt, max_tokens=500):
+    headers = {
+        "Authorization": f"Bearer {GROQ_API_KEY}",
+        "Content-Type": "application/json"
+    }
+    payload = {
+        "model": "groq",
+        "prompt": prompt,
+        "max_tokens": max_tokens
+    }
+    resp = requests.post(GROQ_API_URL, headers=headers, json=payload)
+    resp.raise_for_status()
+    data = resp.json()
+    # Groq usually returns 'output' as list of strings
+    return "".join(data.get("output", []))
 
 def generate_groq_content(title, summary, link):
     prompt = f"""
-    You are a professional e-commerce writer.
-    Generate a short, punchy headline for this deal and a clear description.
-    Make it engaging and concise in HTML format.
-    Product title: {title}
-    Summary: {summary}
-    Link: {link}
-    """
-    response = client.chat.completions.create(
-        model="groq",
-        messages=[{"role": "user", "content": prompt}],
-        max_tokens=300
-    )
-    return response.choices[0].message.content.strip()
+You are a professional e-commerce writer.
+Generate a short, punchy headline for this deal and a clear description.
+Make it engaging and concise in HTML format.
+Product title: {title}
+Summary: {summary}
+Link: {link}
+"""
+    return groq_request(prompt, max_tokens=300)
 
 def generate_structured_commentary(title, summary, link):
     prompt = f"""
-    You are a human-like, persuasive e-commerce writer.
-    Write a 250-word original commentary for this product, summarizing:
-    - Top 3 pros
-    - Top 3 cons
-    - Who it is for
-    - Usage tips
-    Do NOT copy content from anywhere; write in your own words.
-    Product title: {title}
-    Summary: {summary}
-    Link: {link}
-    Output in HTML format with <ul><li>...</li></ul> for pros/cons
-    """
-    response = client.chat.completions.create(
-        model="groq",
-        messages=[{"role": "user", "content": prompt}],
-        max_tokens=500
-    )
-    return response.choices[0].message.content.strip()
+You are a human-like, persuasive e-commerce writer.
+Write a 250-word original commentary for this product, summarizing:
+- Top 3 pros
+- Top 3 cons
+- Who it is for
+- Usage tips
+Do NOT copy content from anywhere; write in your own words.
+Product title: {title}
+Summary: {summary}
+Link: {link}
+Output in HTML format with <ul><li>...</li></ul> for pros/cons
+"""
+    return groq_request(prompt, max_tokens=500)
 
 # ------------------- BLOGGER POST -------------------
 
@@ -114,6 +114,7 @@ def publish_to_blogger(title, content, labels=None):
     if labels:
         data["labels"] = labels
     response = requests.post(url, headers=headers, json=data)
+    response.raise_for_status()
     return response.json()
 
 # ------------------- MAIN SCRIPT -------------------
@@ -141,15 +142,15 @@ def run_once():
             commentary_html = generate_structured_commentary(title, summary, link)
 
             full_post_html = f"""
-            {img_html}
-            <h2>{title}</h2>
-            {main_content}
-            <div style="border:1px solid #ccc; padding:10px; margin-top:15px;">
-                <h3>Commentary & Tips</h3>
-                {commentary_html}
-            </div>
-            <p><a href="{link}" target="_blank">Check Deal</a></p>
-            """
+{img_html}
+<h2>{title}</h2>
+{main_content}
+<div style="border:1px solid #ccc; padding:10px; margin-top:15px;">
+    <h3>Commentary & Tips</h3>
+    {commentary_html}
+</div>
+<p><a href="{link}" target="_blank">Check Deal</a></p>
+"""
 
             response = publish_to_blogger(title, full_post_html, labels=["Deals", "Daily Deals"])
             print(f"Posted: {title} -> {response.get('url')}")
