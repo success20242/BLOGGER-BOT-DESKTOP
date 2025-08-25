@@ -1,25 +1,40 @@
 #!/usr/bin/env python3
-# daily_deals_groq_cloudinary_blogger.py
+# daily_deals_groq_cloudinary_blogger_filtered.py
 # Fully integrated: Groq content + structured commentary + Cloudinary image + Blogger post
+# Only posts RSS items from the last FEED_HOURS_BACK hours
 
 import os
 import json
-import requests
 import hashlib
+import requests
 import feedparser
+from datetime import datetime, timedelta
+from dotenv import load_dotenv
+
+load_dotenv()
 
 # ------------------- CONFIGURATION -------------------
-GROQ_API_KEY = os.getenv("GROQ_API_KEY")  # Your Groq API key
+
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
+GROQ_API_URL = "https://api.groq.com/v1/engines/text/completions"  # Replace with actual endpoint
+
 CLOUDINARY_CLOUD_NAME = os.getenv("CLOUDINARY_CLOUD_NAME")
 CLOUDINARY_API_KEY = os.getenv("CLOUDINARY_API_KEY")
 CLOUDINARY_API_SECRET = os.getenv("CLOUDINARY_API_SECRET")
-BLOGGER_BLOG_ID = os.getenv("BLOGGER_BLOG_ID")
+
+BLOG_ID = os.getenv("BLOG_ID")
 BLOGGER_OAUTH_TOKEN = os.getenv("BLOGGER_OAUTH_TOKEN")
 
-FEED_URLS = [
-    "https://example.com/daily-deals-feed.xml"
+FEEDS = [
+    "https://slickdeals.net/newsearch.php?src=SearchBarV2&q=&mode=rss",
+    "https://www.reddit.com/r/deals/.rss",
+    "https://www.reddit.com/r/GameDeals/.rss",
+    "https://camelcamelcamel.com/top_drops.rss",
 ]
 
+MAX_POSTS = int(os.getenv("MAX_POSTS_PER_RUN", 1))
+FEED_HOURS_BACK = int(os.getenv("FEED_HOURS_BACK", 72))  # Only post items within this many hours
 POSTED_LOG = "posted_links.json"
 
 # ------------------- UTILITIES -------------------
@@ -28,48 +43,60 @@ def load_posted_links():
     if not os.path.exists(POSTED_LOG):
         return set()
     with open(POSTED_LOG, "r") as f:
-        return set(json.load(f))
+        links = json.load(f)
+        print(f"[DEBUG] Loaded {len(links)} posted links")
+        return set(links)
 
 def save_posted_link(link):
     posted = load_posted_links()
     posted.add(link)
     with open(POSTED_LOG, "w") as f:
         json.dump(list(posted), f)
+    print(f"[DEBUG] Saved posted link: {link}")
+
+def hash_text(text):
+    import hashlib
+    return hashlib.md5(text.encode()).hexdigest()
 
 # ------------------- CLOUDINARY -------------------
 
 def upload_image_to_cloudinary(image_url):
+    print(f"[DEBUG] Uploading image to Cloudinary: {image_url}")
     upload_url = f"https://api.cloudinary.com/v1_1/{CLOUDINARY_CLOUD_NAME}/image/upload"
-    response = requests.post(
-        upload_url,
-        data={
-            "file": image_url,
-            "upload_preset": "ml_default"
-        },
-        auth=(CLOUDINARY_API_KEY, CLOUDINARY_API_SECRET)
-    )
-    result = response.json()
-    return result.get("secure_url")
+    try:
+        response = requests.post(
+            upload_url,
+            data={"file": image_url, "upload_preset": "ml_default"},
+            auth=(CLOUDINARY_API_KEY, CLOUDINARY_API_SECRET)
+        )
+        response.raise_for_status()
+        result = response.json()
+        secure_url = result.get("secure_url")
+        print(f"[DEBUG] Cloudinary URL: {secure_url}")
+        return secure_url
+    except Exception as e:
+        print(f"[ERROR] Cloudinary upload failed: {e}")
+        return None
 
 # ------------------- GROQ API -------------------
 
-GROQ_API_URL = "https://api.groq.ai/v1/completions"
-
-def groq_request(prompt, max_tokens=500):
+def groq_generate(prompt, max_tokens=300):
     headers = {
         "Authorization": f"Bearer {GROQ_API_KEY}",
         "Content-Type": "application/json"
     }
     payload = {
-        "model": "groq",
         "prompt": prompt,
         "max_tokens": max_tokens
     }
-    resp = requests.post(GROQ_API_URL, headers=headers, json=payload)
-    resp.raise_for_status()
-    data = resp.json()
-    # Groq usually returns 'output' as list of strings
-    return "".join(data.get("output", []))
+    try:
+        response = requests.post(GROQ_API_URL, headers=headers, json=payload)
+        response.raise_for_status()
+        data = response.json()
+        return data.get("completion_text", "<p>No content generated</p>")
+    except Exception as e:
+        print(f"[ERROR] Groq API request failed: {e}")
+        return "<p>Error generating content.</p>"
 
 def generate_groq_content(title, summary, link):
     prompt = f"""
@@ -80,7 +107,9 @@ Product title: {title}
 Summary: {summary}
 Link: {link}
 """
-    return groq_request(prompt, max_tokens=300)
+    content = groq_generate(prompt, max_tokens=300)
+    print(f"[DEBUG] Generated main content for {title}")
+    return content
 
 def generate_structured_commentary(title, summary, link):
     prompt = f"""
@@ -96,12 +125,14 @@ Summary: {summary}
 Link: {link}
 Output in HTML format with <ul><li>...</li></ul> for pros/cons
 """
-    return groq_request(prompt, max_tokens=500)
+    content = groq_generate(prompt, max_tokens=500)
+    print(f"[DEBUG] Generated commentary for {title}")
+    return content
 
 # ------------------- BLOGGER POST -------------------
 
 def publish_to_blogger(title, content, labels=None):
-    url = f"https://www.googleapis.com/blogger/v3/blogs/{BLOGGER_BLOG_ID}/posts/"
+    url = f"https://www.googleapis.com/blogger/v3/blogs/{BLOG_ID}/posts/"
     headers = {
         "Authorization": f"Bearer {BLOGGER_OAUTH_TOKEN}",
         "Content-Type": "application/json"
@@ -113,30 +144,66 @@ def publish_to_blogger(title, content, labels=None):
     }
     if labels:
         data["labels"] = labels
-    response = requests.post(url, headers=headers, json=data)
-    response.raise_for_status()
-    return response.json()
+    try:
+        response = requests.post(url, headers=headers, json=data)
+        response.raise_for_status()
+        post_data = response.json()
+        print(f"[DEBUG] Published to Blogger: {post_data.get('url')}")
+        return post_data
+    except Exception as e:
+        print(f"[ERROR] Blogger publish failed: {e}")
+        return {}
 
 # ------------------- MAIN SCRIPT -------------------
 
 def run_once():
     posted_links = load_posted_links()
-    for feed_url in FEED_URLS:
-        feed = feedparser.parse(feed_url)
+    posts_count = 0
+    cutoff_time = datetime.utcnow() - timedelta(hours=FEED_HOURS_BACK)
+
+    for feed_url in FEEDS:
+        print(f"[DEBUG] Fetching feed: {feed_url}")
+        try:
+            feed = feedparser.parse(feed_url)
+        except Exception as e:
+            print(f"[ERROR] Failed to parse feed {feed_url}: {e}")
+            continue
+
+        print(f"[DEBUG] Found {len(feed.entries)} entries in feed")
         for entry in feed.entries:
-            if entry.link in posted_links:
+            if posts_count >= MAX_POSTS:
+                print("[DEBUG] Reached max posts limit for this run")
+                return
+
+            # Skip old posts
+            published_parsed = entry.get("published_parsed") or entry.get("updated_parsed")
+            if not published_parsed:
+                print(f"[DEBUG] No timestamp found for {entry.get('title','Unknown')}. Skipping.")
+                continue
+            entry_time = datetime(*published_parsed[:6])
+            if entry_time < cutoff_time:
+                print(f"[DEBUG] Skipping old post: {entry.title} ({entry_time})")
                 continue
 
+            link = entry.link
             title = entry.title
             summary = entry.get("summary", "")
-            link = entry.link
-            image_url = entry.get("media_content", [{}])[0].get("url")
 
+            if link in posted_links:
+                print(f"[DEBUG] Already posted {link}. Skipping.")
+                continue
+
+            image_url = None
+            if "media_content" in entry:
+                image_url = entry.media_content[0].get("url")
+            elif "media_thumbnail" in entry:
+                image_url = entry.media_thumbnail[0].get("url")
+
+            img_html = ""
             if image_url:
                 cloud_image = upload_image_to_cloudinary(image_url)
-                img_html = f'<img src="{cloud_image}" alt="{title}" style="max-width:100%;">'
-            else:
-                img_html = ""
+                if cloud_image:
+                    img_html = f'<img src="{cloud_image}" alt="{title}" style="max-width:100%;">'
 
             main_content = generate_groq_content(title, summary, link)
             commentary_html = generate_structured_commentary(title, summary, link)
@@ -153,8 +220,11 @@ def run_once():
 """
 
             response = publish_to_blogger(title, full_post_html, labels=["Deals", "Daily Deals"])
-            print(f"Posted: {title} -> {response.get('url')}")
-            save_posted_link(link)
+            if response.get("url"):
+                save_posted_link(link)
+                posts_count += 1
+            else:
+                print(f"[ERROR] Failed to save link for {title}")
 
 if __name__ == "__main__":
     run_once()
