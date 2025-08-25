@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# daily_deals_groq_cloudinary_blogger_auto_model.py
+# daily_deals_groq_cloudinary_blogger_fixed.py
 # Fully integrated: Groq content + structured commentary + Cloudinary image + Blogger post
 # Only posts RSS items from the last FEED_HOURS_BACK hours
 
@@ -16,7 +16,8 @@ load_dotenv()
 # ------------------- CONFIGURATION -------------------
 
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"  # OpenAI-compatible endpoint
+GROQ_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-20b")  # Updated valid Groq model
+GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"  # New endpoint
 
 CLOUDINARY_CLOUD_NAME = os.getenv("CLOUDINARY_CLOUD_NAME")
 CLOUDINARY_API_KEY = os.getenv("CLOUDINARY_API_KEY")
@@ -35,32 +36,6 @@ FEEDS = [
 MAX_POSTS = int(os.getenv("MAX_POSTS_PER_RUN", 1))
 FEED_HOURS_BACK = int(os.getenv("FEED_HOURS_BACK", 72))
 POSTED_LOG = "posted_links.json"
-
-# ------------------- GROQ MODEL DYNAMIC SELECTION -------------------
-
-def get_first_available_model():
-    """
-    Fetches available Groq models dynamically and returns the first one.
-    """
-    headers = {"Authorization": f"Bearer {GROQ_API_KEY}"}
-    models_url = "https://api.groq.com/openai/v1/models"
-    try:
-        response = requests.get(models_url, headers=headers)
-        response.raise_for_status()
-        data = response.json()
-        models = [m["id"] for m in data.get("data", [])]
-        if models:
-            print(f"[DEBUG] Available models: {models}")
-            return models[0]  # pick the first available model
-        else:
-            print("[ERROR] No models returned by Groq API; defaulting to 'openai/gpt-oss-20b'")
-            return "openai/gpt-oss-20b"
-    except Exception as e:
-        print(f"[ERROR] Failed to fetch Groq models: {e}")
-        return "openai/gpt-oss-20b"
-
-GROQ_MODEL = get_first_available_model()
-print(f"[DEBUG] Using Groq model: {GROQ_MODEL}")
 
 # ------------------- UTILITIES -------------------
 
