@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # daily_deals_groq_cloudinary_blogger_fixed.py
 # Fully integrated: Groq content + structured commentary + Cloudinary image + Blogger post
-# Auto-refreshing Blogger token using token.pickle
+# Auto-refreshing Blogger token using token.pickle (self-healing + fallback flows)
 
 import os
 import json
@@ -12,7 +12,9 @@ from datetime import datetime, timedelta
 from dotenv import load_dotenv
 from google_auth_oauthlib.flow import InstalledAppFlow
 from google.auth.transport.requests import Request
+from google.auth.exceptions import RefreshError  # <-- ADDED: to catch invalid_grant on refresh
 import pickle
+import sys  # <-- ADDED: for clear error messages
 
 load_dotenv()
 
@@ -27,8 +29,12 @@ CLOUDINARY_API_KEY = os.getenv("CLOUDINARY_API_KEY")
 CLOUDINARY_API_SECRET = os.getenv("CLOUDINARY_API_SECRET")
 
 BLOG_ID = os.getenv("BLOG_ID")
-CLIENT_SECRET_FILE = "client_secret.json"
+# NOTE: We'll auto-detect client secret filename; this is kept for backwards-compat.
+CLIENT_SECRET_FILE = os.getenv("GOOGLE_CLIENT_SECRET_FILE", "client_secret.json")
 TOKEN_PICKLE = "token.pickle"
+
+# OAuth scope for Blogger
+SCOPES = ["https://www.googleapis.com/auth/blogger"]  # <-- ADDED: explicit scopes
 
 FEEDS = [
     "https://slickdeals.net/newsearch.php?src=SearchBarV2&q=&mode=rss",
@@ -40,6 +46,55 @@ FEEDS = [
 MAX_POSTS = int(os.getenv("MAX_POSTS_PER_RUN", 1))
 FEED_HOURS_BACK = int(os.getenv("FEED_HOURS_BACK", 72))
 POSTED_LOG = "posted_links.json"
+
+# ------------------- HELPERS (ADDED) -------------------
+
+def _resolve_client_secret_file():
+    """
+    Find a valid Google OAuth client JSON. We try, in order:
+    1) GOOGLE_CLIENT_SECRET_FILE env var (if points to an existing file)
+    2) client_secret.json (default)
+    3) credentials.json (common alternative name)
+    """
+    candidates = [
+        os.getenv("GOOGLE_CLIENT_SECRET_FILE"),
+        "client_secret.json",
+        "credentials.json",
+    ]
+    for path in candidates:
+        if path and os.path.exists(path):
+            return path
+    raise FileNotFoundError(
+        "Could not find Google OAuth client file. Expected one of: "
+        "GOOGLE_CLIENT_SECRET_FILE, client_secret.json, credentials.json"
+    )
+
+def _save_creds(creds):
+    try:
+        with open(TOKEN_PICKLE, "wb") as f:
+            pickle.dump(creds, f)
+        print(f"[DEBUG] Saved new credentials to {TOKEN_PICKLE}")
+    except Exception as e:
+        print(f"[WARN] Failed to write {TOKEN_PICKLE}: {e}")
+
+def _load_creds():
+    if not os.path.exists(TOKEN_PICKLE):
+        return None
+    try:
+        with open(TOKEN_PICKLE, "rb") as f:
+            creds = pickle.load(f)
+        return creds
+    except Exception as e:
+        print(f"[WARN] Failed to load {TOKEN_PICKLE}: {e}")
+        return None
+
+def _delete_token_pickle():
+    try:
+        if os.path.exists(TOKEN_PICKLE):
+            os.remove(TOKEN_PICKLE)
+            print(f"[DEBUG] Deleted stale {TOKEN_PICKLE}")
+    except Exception as e:
+        print(f"[WARN] Could not delete {TOKEN_PICKLE}: {e}")
 
 # ------------------- UTILITIES -------------------
 
@@ -132,47 +187,102 @@ Output in HTML format with <ul><li>...</li></ul> for pros/cons
     print(f"[DEBUG] Generated commentary for {title}")
     return content
 
-# ------------------- BLOGGER AUTH -------------------
+# ------------------- BLOGGER AUTH (REWRITTEN) -------------------
 
 def get_blogger_token():
-    creds = None
-    if os.path.exists(TOKEN_PICKLE):
-        with open(TOKEN_PICKLE, "rb") as token_file:
-            creds = pickle.load(token_file)
-    if not creds or not creds.valid:
-        if creds and creds.expired and creds.refresh_token:
+    """
+    Returns a valid OAuth access token for Blogger.
+    - Loads token from token.pickle when available.
+    - Refreshes when expired.
+    - If refresh fails (invalid_grant / revoked), forces a clean re-auth.
+    - Falls back to console flow if local server auth fails.
+    """
+    if not BLOG_ID:
+        print("[ERROR] BLOG_ID is not set in environment variables.")
+        sys.exit(1)
+
+    creds = _load_creds()
+
+    # If we already have valid creds, use them
+    if creds and getattr(creds, "valid", False):
+        return creds.token
+
+    # Try to refresh existing creds
+    if creds and getattr(creds, "expired", False) and getattr(creds, "refresh_token", None):
+        try:
             creds.refresh(Request())
-        else:
-            flow = InstalledAppFlow.from_client_secrets_file(CLIENT_SECRET_FILE, ["https://www.googleapis.com/auth/blogger"])
+            _save_creds(creds)
+            return creds.token
+        except RefreshError as e:
+            # This is the classic: invalid_grant -> expired/revoked
+            print(f"[WARN] Refresh failed (expired/revoked): {e}")
+            _delete_token_pickle()
+            creds = None
+        except Exception as e:
+            print(f"[WARN] Refresh failed: {e}")
+            _delete_token_pickle()
+            creds = None
+
+    # If we reach here, we need a fresh authorization
+    client_file = _resolve_client_secret_file()
+    flow = InstalledAppFlow.from_client_secrets_file(client_file, SCOPES)
+
+    # Try local server flow first with offline access if supported by lib version
+    try:
+        try:
+            # Some versions accept access_type/prompt directly
+            creds = flow.run_local_server(port=0, access_type="offline", prompt="consent")
+        except TypeError:
+            # Fallback: older versions without those kwargs
             creds = flow.run_local_server(port=0)
-        with open(TOKEN_PICKLE, "wb") as token_file:
-            pickle.dump(creds, token_file)
+    except Exception as e:
+        print(f"[WARN] Local-server OAuth failed, falling back to console flow: {e}")
+        # Console fallback (works in headless / WSL / SSH)
+        creds = flow.run_console()
+
+    _save_creds(creds)
     return creds.token
 
-# ------------------- BLOGGER POST -------------------
+# ------------------- BLOGGER POST (HARDENED) -------------------
 
 def publish_to_blogger(title, content, labels=None):
+    """
+    Publishes a post to Blogger. If we hit a 401 (bad/expired token),
+    we delete token.pickle and retry once automatically.
+    """
+    def _do_post(token):
+        url = f"https://www.googleapis.com/blogger/v3/blogs/{BLOG_ID}/posts/"
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json"
+        }
+        data = {
+            "kind": "blogger#post",
+            "title": title,
+            "content": content
+        }
+        if labels:
+            data["labels"] = labels
+        return requests.post(url, headers=headers, json=data)
+
+    # First attempt
     token = get_blogger_token()
-    url = f"https://www.googleapis.com/blogger/v3/blogs/{BLOG_ID}/posts/"
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "Content-Type": "application/json"
-    }
-    data = {
-        "kind": "blogger#post",
-        "title": title,
-        "content": content
-    }
-    if labels:
-        data["labels"] = labels
+    response = _do_post(token)
+
+    # If unauthorized, force re-auth once
+    if response.status_code == 401:
+        print("[WARN] Blogger returned 401. Forcing re-auth and retrying once.")
+        _delete_token_pickle()
+        token = get_blogger_token()
+        response = _do_post(token)
+
     try:
-        response = requests.post(url, headers=headers, json=data)
         response.raise_for_status()
         post_data = response.json()
         print(f"[DEBUG] Published to Blogger: {post_data.get('url')}")
         return post_data
     except Exception as e:
-        print(f"[ERROR] Blogger publish failed: {e}")
+        print(f"[ERROR] Blogger publish failed: {e} | Response: {getattr(response, 'text', '')}")
         return {}
 
 # ------------------- MAIN SCRIPT -------------------
